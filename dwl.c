@@ -1,6 +1,7 @@
 /*
  * See LICENSE file for copyright and license details.
  */
+#include <limits.h>
 #include <getopt.h>
 #include <libinput.h>
 #include <linux/input-event-codes.h>
@@ -67,6 +68,7 @@
 #include <xcb/xcb_icccm.h>
 #endif
 
+#include "dwl-ipc-unstable-v2-protocol.h"
 #include "util.h"
 
 /* macros */
@@ -103,6 +105,7 @@ typedef struct {
 	const Arg arg;
 } Button;
 
+typedef struct TreeLayout TreeLayout;
 typedef struct Monitor Monitor;
 typedef struct {
 	/* Must keep these three elements in this order */
@@ -139,9 +142,18 @@ typedef struct {
 #endif
 	unsigned int bw;
 	uint32_t tags;
-	int isfloating, isurgent, isfullscreen;
+	int isfloating, isurgent, isfullscreen, was_tiled;
 	uint32_t resize; /* configure serial of a pending resize */
+	struct wlr_box old_geom;
+	struct wl_list link_tiled;
+	struct wl_list link_temp;
 } Client;
+
+typedef struct {
+	struct wl_list link;
+	struct wl_resource *resource;
+	Monitor *mon;
+} DwlIpcOutput;
 
 typedef struct {
 	uint32_t mod;
@@ -188,6 +200,7 @@ typedef struct {
 
 struct Monitor {
 	struct wl_list link;
+	struct wl_list dwl_ipc_outputs;
 	struct wlr_output *wlr_output;
 	struct wlr_scene_output *scene_output;
 	struct wlr_scene_rect *fullscreen_bg; /* See createmon() for info */
@@ -208,6 +221,7 @@ struct Monitor {
 	int nmaster;
 	char ltsymbol[16];
 	int asleep;
+	TreeLayout *tree_layout;
 };
 
 typedef struct {
@@ -250,6 +264,7 @@ static void arrangelayer(Monitor *m, struct wl_list *list,
 		struct wlr_box *usable_area, int exclusive);
 static void arrangelayers(Monitor *m);
 static void axisnotify(struct wl_listener *listener, void *data);
+static void btrtile(Monitor *m);
 static void buttonpress(struct wl_listener *listener, void *data);
 static void chvt(const Arg *arg);
 static void checkidleinhibitor(struct wlr_surface *exclude);
@@ -285,6 +300,17 @@ static void destroysessionlock(struct wl_listener *listener, void *data);
 static void destroysessionmgr(struct wl_listener *listener, void *data);
 static void destroykeyboardgroup(struct wl_listener *listener, void *data);
 static Monitor *dirtomon(enum wlr_direction dir);
+static void dwl_ipc_manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id);
+static void dwl_ipc_manager_destroy(struct wl_resource *resource);
+static void dwl_ipc_manager_get_output(struct wl_client *client, struct wl_resource *resource, uint32_t id, struct wl_resource *output);
+static void dwl_ipc_manager_release(struct wl_client *client, struct wl_resource *resource);
+static void dwl_ipc_output_destroy(struct wl_resource *resource);
+static void dwl_ipc_output_printstatus(Monitor *monitor);
+static void dwl_ipc_output_printstatus_to(DwlIpcOutput *ipc_output);
+static void dwl_ipc_output_set_client_tags(struct wl_client *client, struct wl_resource *resource, uint32_t and_tags, uint32_t xor_tags);
+static void dwl_ipc_output_set_layout(struct wl_client *client, struct wl_resource *resource, uint32_t index);
+static void dwl_ipc_output_set_tags(struct wl_client *client, struct wl_resource *resource, uint32_t tagmask, uint32_t toggle_tagset);
+static void dwl_ipc_output_release(struct wl_client *client, struct wl_resource *resource);
 static void focusclient(Client *c, int lift);
 static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
@@ -333,11 +359,15 @@ static void setmon(Client *c, Monitor *m, uint32_t newtags);
 static void setpsel(struct wl_listener *listener, void *data);
 static void setsel(struct wl_listener *listener, void *data);
 static void setup(void);
+static void setratio_h(const Arg *arg);
+static void setratio_v(const Arg *arg);
+static void swapclients(const Arg *arg);
 static void spawn(const Arg *arg);
 static void startdrag(struct wl_listener *listener, void *data);
 static void tag(const Arg *arg);
 static void tagmon(const Arg *arg);
 static void tile(Monitor *m);
+static void togglebar(const Arg *arg);
 static void togglefloating(const Arg *arg);
 static void togglefullscreen(const Arg *arg);
 static void toggletag(const Arg *arg);
@@ -413,6 +443,9 @@ static struct wlr_box sgeom;
 static struct wl_list mons;
 static Monitor *selmon;
 
+static struct zdwl_ipc_manager_v2_interface dwl_manager_implementation = {.release = dwl_ipc_manager_release, .get_output = dwl_ipc_manager_get_output};
+static struct zdwl_ipc_output_v2_interface dwl_output_implementation = {.release = dwl_ipc_output_release, .set_tags = dwl_ipc_output_set_tags, .set_layout = dwl_ipc_output_set_layout, .set_client_tags = dwl_ipc_output_set_client_tags};
+
 #ifdef XWAYLAND
 static void activatex11(struct wl_listener *listener, void *data);
 static void associatex11(struct wl_listener *listener, void *data);
@@ -431,6 +464,7 @@ static xcb_atom_t netatom[NetLast];
 
 /* attempt to encapsulate suck into one file */
 #include "client.h"
+#include "btrtile.c"
 
 /* function implementations */
 void
@@ -600,10 +634,17 @@ buttonpress(struct wl_listener *listener, void *data)
 {
 	struct wlr_pointer_button_event *event = data;
 	struct wlr_keyboard *keyboard;
-	uint32_t mods;
-	Client *c;
+	struct wl_list *tiled_clients;
+	struct wlr_surface *surface;
+	double sx, sy;
+	LayoutNode **root, *old_root;
+	uint32_t mods, curtag, active_tags = selmon->tagset[selmon->seltags];
+	Client *c, *target;
 	const Button *b;
 
+	curtag = get_current_tag(selmon);
+	root = &selmon->tree_layout->root[curtag];
+	tiled_clients = &selmon->tree_layout->tiled_clients[curtag];
 	wlr_idle_notifier_v1_notify_activity(idle_notifier, seat);
 
 	switch (event->state) {
@@ -632,15 +673,49 @@ buttonpress(struct wl_listener *listener, void *data)
 		/* If you released any buttons, we exit interactive move/resize mode. */
 		/* TODO should reset to the pointer focus's current setcursor */
 		if (!locked && cursor_mode != CurNormal && cursor_mode != CurPressed) {
+			c = grabc;
+			if (c && c->was_tiled && !strcmp(selmon->ltsymbol, "|w|")) {
+				/* Check if more than one tag is active, if so we escape */
+				if (active_tags && (active_tags & (active_tags - 1)))
+					break;
+				if (cursor_mode == CurMove && c->isfloating) {
+					target = NULL;
+					surface = NULL;
+					xytonode(cursor->x, cursor->y, &surface, &target, NULL, &sx, &sy);
+
+					if (target && !target->isfloating && !target->isfullscreen) {
+						insert_client(selmon, target, c, root, tiled_clients);
+					} else {
+						if (!root) {
+							*root = create_client_node(c);
+							add_client_to_tiled_list(c, tiled_clients);
+						} else {
+							old_root = *root;
+							*root = create_split_node(1, old_root, create_client_node(c));
+							add_client_to_tiled_list(c, tiled_clients);
+						}
+					}
+
+					setfloating(c, 0);
+					arrange(selmon);
+
+				} else if (cursor_mode == CurResize && !c->isfloating) {
+					resizing_from_mouse = 0;
+				}
+			} else {
+				if (cursor_mode == CurResize && resizing_from_mouse)
+					resizing_from_mouse = 0;
+			}
+			/* Default behaviour */
 			wlr_cursor_set_xcursor(cursor, cursor_mgr, "default");
 			cursor_mode = CurNormal;
 			/* Drop the window off on its new monitor */
 			selmon = xytomon(cursor->x, cursor->y);
 			setmon(grabc, selmon, 0);
+			grabc = NULL;
 			return;
-		} else {
-			cursor_mode = CurNormal;
 		}
+		cursor_mode = CurNormal;
 		break;
 	}
 	/* If the event wasn't handled by the compositor, notify the client with
@@ -706,6 +781,10 @@ cleanupmon(struct wl_listener *listener, void *data)
 	LayerSurface *l, *tmp;
 	size_t i;
 
+	DwlIpcOutput *ipc_output, *ipc_output_tmp;
+	wl_list_for_each_safe(ipc_output, ipc_output_tmp, &m->dwl_ipc_outputs, link)
+		wl_resource_destroy(ipc_output->resource);
+
 	/* m->layers[i] are intentionally not unlinked */
 	for (i = 0; i < LENGTH(m->layers); i++) {
 		wl_list_for_each_safe(l, tmp, &m->layers[i], link)
@@ -720,6 +799,9 @@ cleanupmon(struct wl_listener *listener, void *data)
 	wlr_output_layout_remove(output_layout, m->wlr_output);
 	wlr_scene_output_destroy(m->scene_output);
 
+	destroy_tree_layout(m);
+	free(m->tree_layout);
+	m->tree_layout = NULL;
 	closemon(m);
 	wlr_scene_node_destroy(&m->fullscreen_bg->node);
 	free(m);
@@ -986,6 +1068,8 @@ createmon(struct wl_listener *listener, void *data)
 	m = wlr_output->data = ecalloc(1, sizeof(*m));
 	m->wlr_output = wlr_output;
 
+	wl_list_init(&m->dwl_ipc_outputs);
+
 	for (i = 0; i < LENGTH(m->layers); i++)
 		wl_list_init(&m->layers[i]);
 
@@ -1024,6 +1108,7 @@ createmon(struct wl_listener *listener, void *data)
 
 	wl_list_insert(&mons, &m->link);
 	printstatus();
+	init_tree_layout(m);
 
 	/* The xdg-protocol specifies:
 	 *
@@ -1263,6 +1348,15 @@ destroynotify(struct wl_listener *listener, void *data)
 	wl_list_remove(&c->destroy.link);
 	wl_list_remove(&c->set_title.link);
 	wl_list_remove(&c->fullscreen.link);
+	/* We check if the destroyed client was part of any tiled_list, to catch
+	 * client removals even if they would not be currently managed by btrtile */
+	if (selmon && selmon->tree_layout) {
+		for (int i = 0; i < TAGCOUNT; i++) {
+			remove_client(selmon, c,
+		 &selmon->tree_layout->root[i],
+		 &selmon->tree_layout->tiled_clients[i]);
+		}
+	}
 #ifdef XWAYLAND
 	if (c->type != XDGShell) {
 		wl_list_remove(&c->activate.link);
@@ -1334,6 +1428,212 @@ dirtomon(enum wlr_direction dir)
 			selmon->wlr_output, selmon->m.x, selmon->m.y)))
 		return next->data;
 	return selmon;
+}
+
+void
+dwl_ipc_manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+	struct wl_resource *manager_resource = wl_resource_create(client, &zdwl_ipc_manager_v2_interface, version, id);
+	if (!manager_resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(manager_resource, &dwl_manager_implementation, NULL, dwl_ipc_manager_destroy);
+
+	zdwl_ipc_manager_v2_send_tags(manager_resource, TAGCOUNT);
+
+	for (unsigned int i = 0; i < LENGTH(layouts); i++)
+		zdwl_ipc_manager_v2_send_layout(manager_resource, layouts[i].symbol);
+}
+
+void
+dwl_ipc_manager_destroy(struct wl_resource *resource)
+{
+	/* No state to destroy */
+}
+
+void
+dwl_ipc_manager_get_output(struct wl_client *client, struct wl_resource *resource, uint32_t id, struct wl_resource *output)
+{
+	DwlIpcOutput *ipc_output;
+	Monitor *monitor = wlr_output_from_resource(output)->data;
+	struct wl_resource *output_resource = wl_resource_create(client, &zdwl_ipc_output_v2_interface, wl_resource_get_version(resource), id);
+	if (!output_resource)
+		return;
+
+	ipc_output = ecalloc(1, sizeof(*ipc_output));
+	ipc_output->resource = output_resource;
+	ipc_output->mon = monitor;
+	wl_resource_set_implementation(output_resource, &dwl_output_implementation, ipc_output, dwl_ipc_output_destroy);
+	wl_list_insert(&monitor->dwl_ipc_outputs, &ipc_output->link);
+	dwl_ipc_output_printstatus_to(ipc_output);
+}
+
+void
+dwl_ipc_manager_release(struct wl_client *client, struct wl_resource *resource)
+{
+	wl_resource_destroy(resource);
+}
+
+static void
+dwl_ipc_output_destroy(struct wl_resource *resource)
+{
+	DwlIpcOutput *ipc_output = wl_resource_get_user_data(resource);
+	wl_list_remove(&ipc_output->link);
+	free(ipc_output);
+}
+
+void
+dwl_ipc_output_printstatus(Monitor *monitor)
+{
+	DwlIpcOutput *ipc_output;
+	wl_list_for_each(ipc_output, &monitor->dwl_ipc_outputs, link)
+		dwl_ipc_output_printstatus_to(ipc_output);
+}
+
+void
+dwl_ipc_output_printstatus_to(DwlIpcOutput *ipc_output)
+{
+	Monitor *monitor = ipc_output->mon;
+	Client *c, *focused;
+	int tagmask, state, numclients, focused_client, tag;
+	const char *title, *appid;
+	focused = focustop(monitor);
+	zdwl_ipc_output_v2_send_active(ipc_output->resource, monitor == selmon);
+
+	for (tag = 0 ; tag < TAGCOUNT; tag++) {
+		numclients = state = focused_client = 0;
+		tagmask = 1 << tag;
+		if ((tagmask & monitor->tagset[monitor->seltags]) != 0)
+			state |= ZDWL_IPC_OUTPUT_V2_TAG_STATE_ACTIVE;
+
+		wl_list_for_each(c, &clients, link) {
+			if (c->mon != monitor)
+				continue;
+			if (!(c->tags & tagmask))
+				continue;
+			if (c == focused)
+				focused_client = 1;
+			if (c->isurgent)
+				state |= ZDWL_IPC_OUTPUT_V2_TAG_STATE_URGENT;
+
+			numclients++;
+		}
+		zdwl_ipc_output_v2_send_tag(ipc_output->resource, tag, state, numclients, focused_client);
+	}
+	title = focused ? client_get_title(focused) : "";
+	appid = focused ? client_get_appid(focused) : "";
+
+	zdwl_ipc_output_v2_send_layout(ipc_output->resource, monitor->lt[monitor->sellt] - layouts);
+	zdwl_ipc_output_v2_send_title(ipc_output->resource, title);
+	zdwl_ipc_output_v2_send_appid(ipc_output->resource, appid);
+	zdwl_ipc_output_v2_send_layout_symbol(ipc_output->resource, monitor->ltsymbol);
+	if (wl_resource_get_version(ipc_output->resource) >= ZDWL_IPC_OUTPUT_V2_FULLSCREEN_SINCE_VERSION) {
+		zdwl_ipc_output_v2_send_fullscreen(ipc_output->resource, focused ? focused->isfullscreen : 0);
+	}
+	if (wl_resource_get_version(ipc_output->resource) >= ZDWL_IPC_OUTPUT_V2_FLOATING_SINCE_VERSION) {
+		zdwl_ipc_output_v2_send_floating(ipc_output->resource, focused ? focused->isfloating : 0);
+	}
+	zdwl_ipc_output_v2_send_frame(ipc_output->resource);
+}
+
+void
+dwl_ipc_output_set_client_tags(struct wl_client *client, struct wl_resource *resource, uint32_t and_tags, uint32_t xor_tags)
+{
+	DwlIpcOutput *ipc_output;
+	Monitor *monitor;
+	Client *selected_client;
+	unsigned int newtags = 0;
+
+	ipc_output = wl_resource_get_user_data(resource);
+	if (!ipc_output)
+		return;
+
+	monitor = ipc_output->mon;
+	selected_client = focustop(monitor);
+	if (!selected_client)
+		return;
+
+	newtags = (selected_client->tags & and_tags) ^ xor_tags;
+	if (!newtags)
+		return;
+
+	selected_client->tags = newtags;
+	if (selmon == monitor)
+		focusclient(focustop(monitor), 1);
+	arrange(selmon);
+	printstatus();
+}
+
+void
+dwl_ipc_output_set_layout(struct wl_client *client, struct wl_resource *resource, uint32_t index)
+{
+	DwlIpcOutput *ipc_output;
+	Client *c = NULL;
+	Monitor *monitor = NULL;
+
+	ipc_output = wl_resource_get_user_data(resource);
+	if (!ipc_output)
+		return;
+	monitor = ipc_output->mon;
+
+	if (monitor != selmon)
+		c = focustop(selmon);
+
+	if (index >= LENGTH(layouts))
+		return;
+
+	if (c) {
+		monitor = selmon;
+		selmon = ipc_output->mon;
+	}
+	setlayout(&(Arg){.v = &layouts[index]});
+	if (c) {
+		selmon = monitor;
+		focusclient(c, 0);
+	}
+}
+
+void
+dwl_ipc_output_set_tags(struct wl_client *client, struct wl_resource *resource, uint32_t tagmask, uint32_t toggle_tagset)
+{
+	DwlIpcOutput *ipc_output;
+	Client *c = NULL;
+	Monitor *monitor = NULL;
+	unsigned int newtags = tagmask & TAGMASK;
+
+	ipc_output = wl_resource_get_user_data(resource);
+	if (!ipc_output)
+		return;
+	monitor = ipc_output->mon;
+
+	if (monitor != selmon)
+		c = focustop(selmon);
+
+	if (!newtags)
+		return;
+
+	/* view toggles seltags for us so we un-toggle it */
+	if (!toggle_tagset) {
+		monitor->seltags ^= 1;
+		monitor->tagset[monitor->seltags] = 0;
+	}
+
+	if (c) {
+		monitor = selmon;
+		selmon = ipc_output->mon;
+	}
+	view(&(Arg){.ui = newtags});
+	if (c) {
+		selmon = monitor;
+		focusclient(c, 0);
+	}
+}
+
+void
+dwl_ipc_output_release(struct wl_client *client, struct wl_resource *resource)
+{
+	wl_resource_destroy(resource);
 }
 
 void
@@ -1809,7 +2109,8 @@ void
 motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double dy,
 		double dx_unaccel, double dy_unaccel)
 {
-	double sx = 0, sy = 0, sx_confined, sy_confined;
+	int tiled = 0;
+	double sx = 0, sy = 0, sx_confined, sy_confined, dx_total, dy_total;
 	Client *c = NULL, *w = NULL;
 	LayerSurface *l = NULL;
 	struct wlr_surface *surface = NULL;
@@ -1863,18 +2164,56 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 	/* Update drag icon's position */
 	wlr_scene_node_set_position(&drag_icon->node, (int)round(cursor->x), (int)round(cursor->y));
 
-	/* If we are currently grabbing the mouse, handle and return */
+	/* Skip if internal call or already resizing */
+	if (time == 0 && resizing_from_mouse)
+		goto focus;
+
+	tiled = grabc && !grabc->isfloating && !grabc->isfullscreen;
 	if (cursor_mode == CurMove) {
 		/* Move the grabbed client to the new position. */
-		resize(grabc, (struct wlr_box){.x = (int)round(cursor->x) - grabcx, .y = (int)round(cursor->y) - grabcy,
-			.width = grabc->geom.width, .height = grabc->geom.height}, 1);
-		return;
+		if (grabc && grabc->isfloating) {
+			resize(grabc, (struct wlr_box){
+				.x = (int)round(cursor->x) - grabcx,
+				.y = (int)round(cursor->y) - grabcy,
+				.width = grabc->geom.width,
+				.height = grabc->geom.height
+			}, 1);
+			return;
+		}
 	} else if (cursor_mode == CurResize) {
-		resize(grabc, (struct wlr_box){.x = grabc->geom.x, .y = grabc->geom.y,
-			.width = (int)round(cursor->x) - grabc->geom.x, .height = (int)round(cursor->y) - grabc->geom.y}, 1);
-		return;
+		if (tiled && resizing_from_mouse) {
+			dx_total = cursor->x - resize_last_update_x;
+			dy_total = cursor->y - resize_last_update_y;
+
+			if (time - last_resize_time >= resize_interval_ms) {
+				Arg a = {0};
+				if (fabs(dx_total) > fabs(dy_total)) {
+					a.f = (float)(dx_total * resize_factor);
+					setratio_h(&a);
+				} else {
+					a.f = (float)(dy_total * resize_factor);
+					setratio_v(&a);
+				}
+				arrange(selmon);
+
+				last_resize_time = time;
+				resize_last_update_x = cursor->x;
+				resize_last_update_y = cursor->y;
+			}
+
+		} else if (grabc && grabc->isfloating) {
+			/* Floating resize as original */
+			resize(grabc, (struct wlr_box){
+				.x = grabc->geom.x,
+				.y = grabc->geom.y,
+				.width = (int)round(cursor->x) - grabc->geom.x,
+				.height = (int)round(cursor->y) - grabc->geom.y
+			}, 1);
+			return;
+		}
 	}
 
+focus:
 	/* If there's no client surface under the cursor, set the cursor image to a
 	 * default. This is what makes the cursor image appear when you move it
 	 * off of a client or over its border. */
@@ -1908,22 +2247,41 @@ moveresize(const Arg *arg)
 	if (!grabc || client_is_unmanaged(grabc) || grabc->isfullscreen)
 		return;
 
-	/* Float the window and tell motionnotify to grab it */
-	setfloating(grabc, 1);
-	switch (cursor_mode = arg->ui) {
-	case CurMove:
-		grabcx = (int)round(cursor->x) - grabc->geom.x;
-		grabcy = (int)round(cursor->y) - grabc->geom.y;
-		wlr_cursor_set_xcursor(cursor, cursor_mgr, "fleur");
-		break;
-	case CurResize:
-		/* Doesn't work for X11 output - the next absolute motion event
-		 * returns the cursor to where it started */
-		wlr_cursor_warp_closest(cursor, NULL,
+	cursor_mode = arg->ui;
+	grabc->was_tiled = (!grabc->isfloating && !grabc->isfullscreen);
+
+	if (grabc->was_tiled) {
+		switch (cursor_mode) {
+			case CurMove:
+				setfloating(grabc, 1);
+				grabcx = (int)round(cursor->x) - grabc->geom.x;
+				grabcy = (int)round(cursor->y) - grabc->geom.y;
+				wlr_cursor_set_xcursor(cursor, cursor_mgr, "fleur");
+				break;
+			case CurResize:
+				wlr_cursor_set_xcursor(cursor, cursor_mgr, "se-resize");
+				resize_last_update_x = cursor->x;
+				resize_last_update_y = cursor->y;
+				resizing_from_mouse = 1;
+				break;
+		}
+	} else {
+		/* Default floating logic */
+		/* Float the window and tell motionnotify to grab it */
+		setfloating(grabc, 1);
+		switch (cursor_mode) {
+			case CurMove:
+				grabcx = (int)round(cursor->x) - grabc->geom.x;
+				grabcy = (int)round(cursor->y) - grabc->geom.y;
+				wlr_cursor_set_xcursor(cursor, cursor_mgr, "fleur");
+				break;
+			case CurResize:
+				wlr_cursor_warp_closest(cursor, NULL,
 				grabc->geom.x + grabc->geom.width,
 				grabc->geom.y + grabc->geom.height);
-		wlr_cursor_set_xcursor(cursor, cursor_mgr, "se-resize");
-		break;
+				wlr_cursor_set_xcursor(cursor, cursor_mgr, "se-resize");
+				break;
+		}
 	}
 }
 
@@ -2036,41 +2394,8 @@ void
 printstatus(void)
 {
 	Monitor *m = NULL;
-	Client *c;
-	uint32_t occ, urg, sel;
-	const char *appid, *title;
-
-	wl_list_for_each(m, &mons, link) {
-		occ = urg = 0;
-		wl_list_for_each(c, &clients, link) {
-			if (c->mon != m)
-				continue;
-			occ |= c->tags;
-			if (c->isurgent)
-				urg |= c->tags;
-		}
-		if ((c = focustop(m))) {
-			title = client_get_title(c);
-			appid = client_get_appid(c);
-			printf("%s title %s\n", m->wlr_output->name, title ? title : broken);
-			printf("%s appid %s\n", m->wlr_output->name, appid ? appid : broken);
-			printf("%s fullscreen %d\n", m->wlr_output->name, c->isfullscreen);
-			printf("%s floating %d\n", m->wlr_output->name, c->isfloating);
-			sel = c->tags;
-		} else {
-			printf("%s title \n", m->wlr_output->name);
-			printf("%s appid \n", m->wlr_output->name);
-			printf("%s fullscreen \n", m->wlr_output->name);
-			printf("%s floating \n", m->wlr_output->name);
-			sel = 0;
-		}
-
-		printf("%s selmon %u\n", m->wlr_output->name, m == selmon);
-		printf("%s tags %"PRIu32" %"PRIu32" %"PRIu32" %"PRIu32"\n",
-			m->wlr_output->name, occ, m->tagset[m->seltags], sel, urg);
-		printf("%s layout %s\n", m->wlr_output->name, m->ltsymbol);
-	}
-	fflush(stdout);
+	wl_list_for_each(m, &mons, link)
+	dwl_ipc_output_printstatus(m);
 }
 
 void
@@ -2625,6 +2950,8 @@ setup(void)
 	LISTEN_STATIC(&output_mgr->events.apply, outputmgrapply);
 	LISTEN_STATIC(&output_mgr->events.test, outputmgrtest);
 
+	wl_global_create(dpy, &zdwl_ipc_manager_v2_interface, 2, NULL, dwl_ipc_manager_bind);
+
 	/* Make sure XWayland clients don't connect to the parent X server,
 	 * e.g when running in the x11 backend or the wayland backend and the
 	 * compositor has Xwayland support */
@@ -2720,6 +3047,13 @@ tile(Monitor *m)
 		}
 		i++;
 	}
+}
+
+void
+togglebar(const Arg *arg) {
+	DwlIpcOutput *ipc_output;
+	wl_list_for_each(ipc_output, &selmon->dwl_ipc_outputs, link)
+		zdwl_ipc_output_v2_send_toggle_visibility(ipc_output->resource);
 }
 
 void
