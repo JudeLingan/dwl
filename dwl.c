@@ -314,6 +314,7 @@ static void dwl_ipc_output_release(struct wl_client *client, struct wl_resource 
 static void focusclient(Client *c, int lift);
 static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
+static void focusdir(const Arg *arg);
 static Client *focustop(Monitor *m);
 static void fullscreennotify(struct wl_listener *listener, void *data);
 static void gpureset(struct wl_listener *listener, void *data);
@@ -381,6 +382,7 @@ static void urgent(struct wl_listener *listener, void *data);
 static void view(const Arg *arg);
 static void virtualkeyboard(struct wl_listener *listener, void *data);
 static void virtualpointer(struct wl_listener *listener, void *data);
+static void warpcursor(const Client *c);
 static Monitor *xytomon(double x, double y);
 static void xytonode(double x, double y, struct wlr_surface **psurface,
 		Client **pc, LayerSurface **pl, double *nx, double *ny);
@@ -553,6 +555,7 @@ arrange(Monitor *m)
 		m->lt[m->sellt]->arrange(m);
 	motionnotify(0, NULL, 0, 0, 0, 0);
 	checkidleinhibitor(NULL);
+	warpcursor(focustop(selmon));
 }
 
 void
@@ -1647,6 +1650,10 @@ focusclient(Client *c, int lift)
 	if (locked)
 		return;
 
+	/* Warp cursor to center of client if it is outside */
+	if (lift)
+		warpcursor(c);
+
 	/* Raise client in stacking order if requested */
 	if (c && lift)
 		wlr_scene_node_raise_to_top(&c->scene->node);
@@ -1748,6 +1755,49 @@ focusstack(const Arg *arg)
 	/* If only one client is visible on selmon, then c == sel */
 	focusclient(c, 1);
 }
+
+void focusdir(const Arg *arg)
+{
+	/* Focus the left, right, up, down client relative to the current focused client on selmon */
+  Client *c, *sel = focustop(selmon);
+	if (!sel || sel->isfullscreen)
+		return;
+
+  int dist=INT_MAX;
+  Client *newsel = NULL;
+  int newdist=INT_MAX;
+  wl_list_for_each(c, &clients, link) {
+    if (!VISIBLEON(c, selmon))
+      continue; /* skip non visible windows */
+
+    if (arg->ui == 0 && sel->geom.x <= c->geom.x) {
+      /* Client isn't on our left */
+      continue;
+    }
+    if (arg->ui == 1 && sel->geom.x >= c->geom.x) {
+      /* Client isn't on our right */
+      continue;
+    }
+    if (arg->ui == 2 && sel->geom.y <= c->geom.y) {
+      /* Client isn't above us */
+      continue;
+    }
+    if (arg->ui == 3 && sel->geom.y >= c->geom.y) {
+      /* Client isn't below us */
+      continue;
+    }
+
+    dist=abs(sel->geom.x-c->geom.x)+abs(sel->geom.y-c->geom.y);
+    if (dist < newdist){
+      newdist = dist;
+      newsel=c;
+    }
+  }
+  if (newsel != NULL){
+    focusclient(newsel, 1);
+  }
+}
+
 
 /* We probably should change the name of this, it sounds like
  * will focus the topmost client of this mon, when actually will
@@ -3315,6 +3365,27 @@ virtualpointer(struct wl_listener *listener, void *data)
 	wlr_cursor_attach_input_device(cursor, device);
 	if (event->suggested_output)
 		wlr_cursor_map_input_to_output(cursor, device, event->suggested_output);
+}
+
+void
+warpcursor(const Client *c) {
+	if (cursor_mode != CurNormal) {
+		return;
+	}
+	if (!c && selmon) {
+		wlr_cursor_warp_closest(cursor,
+			  NULL,
+			  selmon->w.x + selmon->w.width / 2.0 ,
+			  selmon->w.y + selmon->w.height / 2.0);
+	}
+	else if ( c && (cursor->x < c->geom.x ||
+		cursor->x > c->geom.x + c->geom.width ||
+		cursor->y < c->geom.y ||
+		cursor->y > c->geom.y + c->geom.height))
+		wlr_cursor_warp_closest(cursor,
+			  NULL,
+			  c->geom.x + c->geom.width / 2.0,
+			  c->geom.y + c->geom.height / 2.0);
 }
 
 Monitor *
